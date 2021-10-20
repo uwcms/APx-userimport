@@ -1,0 +1,644 @@
+#!/usr/bin/python3
+
+import datetime
+import functools
+import grp
+import os
+import pwd
+import re
+import signal
+import subprocess
+import sys
+import textwrap
+import time
+from pathlib import Path
+from typing import (Dict, Generic, Iterator, List, NoReturn, Optional, Tuple, TypeVar, Union, cast)
+
+if os.geteuid() != 0:
+	print('You must run this command with sudo.', file=sys.stderr)
+	print('Unable to proceed.', file=sys.stderr)
+	raise SystemExit(1)
+
+if not os.environ.get('SUDO_USER', ''):
+	# We need to use this to detect the home directory pattern off an existing user.
+	print('You must run this command with sudo directly, not via a root shell.', file=sys.stderr)
+	print('Unable to proceed.', file=sys.stderr)
+	raise SystemExit(1)
+
+try:
+	template_pwent = pwd.getpwnam(os.environ['SUDO_USER'])
+except KeyError:
+	print('The user ' + repr(os.environ['SUDO_USER']) + ' was not found in the passwd database.', file=sys.stderr)
+	print('Unable to proceed.', file=sys.stderr)
+	raise SystemExit(1)
+
+template_home = Path(template_pwent.pw_dir)
+if template_home.name != template_pwent.pw_name:
+	print(
+	    'The final path component of the homedir for "{pwent.pw_name}" was not "{pwent.pw_name}".'.format(
+	        pwent=template_pwent
+	    ),
+	    file=sys.stderr
+	)
+	print('Unable to detect home directory base path.', file=sys.stderr)
+	print('Unable to proceed.', file=sys.stderr)
+	raise SystemExit(1)
+
+print(
+    textwrap.dedent(
+        '''\
+	Please connect to the control PC, and for each user you wish to add to this
+	system, run:
+	$ getent passwd $USER; id $USER
+
+	For example:
+	$ getent passwd jtikalsky; id jtikalsky
+	jtikalsky:x:4156:4156:Jesra Tikalsky:/afs/hep.wisc.edu/home/jtikalsky:/bin/bash
+	uid=4156(jtikalsky) gid=4156(jtikalsky) groups=4156(jtikalsky),5556(users),19000(cms)
+
+	Paste the results to this program, then press Ctrl-D when finished.
+	'''
+    )
+)
+
+
+class ConflictError(ValueError):
+	pass
+
+
+class DuplicateError(ValueError):
+	def __init__(self, *args: object, field: str) -> None:
+		super().__init__(*args)
+		self.field = field
+
+
+T = TypeVar('T')
+
+
+class DualDB(Generic[T]):
+	by_id: Dict[int, T]
+	by_name: Dict[str, T]
+	_idfield: str
+	_namefield: str
+
+	def __init__(self, idfield: str, namefield: str):
+		self.by_id = {}
+		self.by_name = {}
+		self._idfield = idfield
+		self._namefield = namefield
+
+	def __len__(self) -> int:
+		assert len(self.by_id) == len(self.by_name)
+		return len(self.by_id)
+
+	def __getitem__(self, key: Union[int, str, T], *, strict: bool = False) -> T:
+		try:
+			if isinstance(key, int):
+				return self.by_id[key]
+			elif isinstance(key, str):
+				return self.by_name[key]
+			elif hasattr(key, self._idfield) and hasattr(key, self._namefield):
+				v = self.by_id[getattr(key, self._idfield)]
+				if strict and key is not v:
+					raise KeyError(key)
+				if getattr(key, self._namefield) != getattr(v, self._namefield):
+					raise KeyError(key)
+				return v
+			else:
+				raise KeyError('Invalid key type.')
+		except KeyError as e:
+			raise KeyError(key) from None
+
+	def __delitem__(self, key: Union[int, str, T]) -> None:
+		try:
+			self.remove(self.__getitem__(key, strict=True))
+		except KeyError as e:
+			raise KeyError(key) from None
+
+	def __contains__(self, key: Union[int, str, T], *, strict: bool = False) -> bool:
+		try:
+			self.__getitem__(key, strict=strict)
+		except KeyError:
+			return False
+		else:
+			return True
+
+	def __iter__(self) -> Iterator[T]:
+		return iter(list(self.by_id.values()))
+
+	def add(self, obj: T) -> None:
+		objid = cast(int, getattr(obj, self._idfield))
+		objname = cast(str, getattr(obj, self._namefield))
+		if objid in self.by_id and self.by_id[objid] is not obj:
+			raise DuplicateError(
+			    'Another entity with the same {id} is already in this database.'.format(id=self._idfield),
+			    field=self._idfield
+			)
+		if objname in self.by_name and self.by_name[objname] is not obj:
+			raise DuplicateError(
+			    'Another object with the same {name} is already in this database.'.format(name=self._namefield),
+			    field=self._namefield
+			)
+		self.by_id[objid] = obj
+		self.by_name[objname] = obj
+
+	def remove(self, obj: T) -> None:
+		objid = cast(int, getattr(obj, self._idfield))
+		objname = cast(str, getattr(obj, self._namefield))
+		if self.by_id.get(objid, obj) is not obj:
+			raise KeyError('A different object is in the database with this id.')
+		if self.by_name.get(objname, obj) is not obj:
+			raise KeyError('A different object is in the database with this name.')
+		self.by_id.pop(objid, None)
+		self.by_name.pop(objname, None)
+
+
+@functools.total_ordering
+class GroupEntry(object):
+	name: str = ''
+	gid: int = 0
+	members: List[str]
+
+	existing: bool
+
+	def __init__(self, load: Optional[grp.struct_group] = None):
+		self.members = []
+		if load is not None:
+			self.name = load.gr_name
+			self.gid = load.gr_gid
+			self.members = list(load.gr_mem)
+		self.existing = load is not None
+
+	def __lt__(self, o: 'GroupEntry') -> bool:
+		if isinstance(o, GroupEntry):
+			return (self.gid, self.name) < (o.gid, o.name)
+		return NotImplemented
+
+	def __eq__(self, o: 'GroupEntry') -> bool:
+		if isinstance(o, GroupEntry):
+			return (self.gid, self.name) == (o.gid, o.name)
+		return NotImplemented
+
+	def __repr__(self) -> str:
+		info: Dict[str, str] = {}
+		for field in ('name', 'gid', 'members'):
+			info[field] = repr(getattr(self, field))
+		return 'GroupEntry(name={name}, gid={gid}, members={members})'.format(**info)
+
+
+@functools.total_ordering
+class UserEntry(object):
+	name: str = ''
+	uid: int = 0
+	gid: int = 0
+	gecos: str = ''
+	home: str = ''
+	shell: str = ''
+	groups: List[GroupEntry]
+
+	existing: bool
+
+	def __init__(self, load: Optional[pwd.struct_passwd] = None):
+		self.groups = []
+		if load:
+			self.name = load.pw_name
+			self.uid = load.pw_uid
+			self.gid = load.pw_gid
+			self.gecos = load.pw_gecos
+			self.home = load.pw_dir
+			self.shell = load.pw_shell
+			# Can't import supplementary groups this way.
+		self.existing = load is not None
+
+	def __lt__(self, o: 'UserEntry') -> bool:
+		if isinstance(o, UserEntry):
+			return (self.uid, self.name) < (o.uid, o.name)
+		return NotImplemented
+
+	def __eq__(self, o: 'UserEntry') -> bool:
+		if isinstance(o, UserEntry):
+			return (self.uid, self.name) == (o.uid, o.name)
+		return NotImplemented
+
+	def update(self, **parameters: str) -> None:
+		for field, value in parameters.items():
+			try:
+				value = type(getattr(self, field))(value)
+			except TypeError:
+				raise TypeError(
+				    'Unexpected datatype for field {field}, expected {type}.'.format(
+				        field=field, type=type(getattr(self, field)).__name__
+				    )
+				)
+			if getattr(self, field) and getattr(self, field) != value:
+				raise ConflictError(
+				    'User "{name}" cannot have both {field}={oldvalue} and {field}={newvalue}.'.format(
+				        name=self.name, field=field, oldvalue=repr(getattr(self, field)), newvalue=repr(value)
+				    )
+				)
+			setattr(self, field, type(getattr(self, field))(value))
+
+	def gen_passwd(self) -> str:
+		# jtikalsky:x:4156:4156:Jesra Tikalsky:/afs/hep.wisc.edu/home/jtikalsky:/bin/bash
+		return '{self.name}:x:{uid}:{gid}:{self.gecos}:{self.home}:{self.shell}'.format(
+		    self=self, uid=self.uid if self.uid else -1, gid=self.gid if self.gid else -1
+		)
+
+	def gen_shadow(self) -> str:
+		age = (datetime.date.today() - datetime.date(1970, 1, 1)).days
+		return '{self.name}:*:{age}:0:99999:7:::'.format(self=self, age=age)
+
+	def __repr__(self) -> str:
+		info: Dict[str, str] = {}
+		for field in ('name', 'uid', 'gid', 'gecos', 'home', 'shell', 'groups'):
+			info[field] = repr(getattr(self, field))
+		return 'UserEntry(name={name}, uid={uid}, gid={gid}, gecos={gecos}, home={home}, shell={shell}, groups={groups})'.format(
+		    **info
+		)
+
+
+def die(msg: str, final: str = 'Terminating.  No work done.') -> NoReturn:
+	msg = textwrap.dedent(msg)
+	msg = '\n'.join([textwrap.fill(x) for x in msg.rstrip('\n').split('\n\n')])
+	msg = '\n' + msg + '\n'
+	print(msg, file=sys.stderr)
+	if final:
+		print(final, file=sys.stderr)
+	raise SystemExit(1)
+
+
+inputlines = sys.stdin.read().split('\n')
+print()
+users: DualDB[UserEntry] = DualDB('uid', 'name')
+groups: DualDB[GroupEntry] = DualDB('gid', 'name')
+
+
+def load_existing_dbs(users: DualDB[UserEntry], groups: DualDB[GroupEntry]) -> None:
+	print('Loading existing user and group databases.')
+	for pwent in pwd.getpwall():
+		try:
+			users.add(UserEntry(pwent))
+		except DuplicateError as e:
+			die(
+			    '''\
+				The existing user database is inconsistent.  User "{user}" is a duplicate.
+
+				This requires careful attention from a sysadmin.  Do not retry.
+				'''.format(user=pwent.pw_name)
+			)
+	for grent in grp.getgrall():
+		try:
+			group = GroupEntry(grent)
+			groups.add(group)
+		except DuplicateError as e:
+			die(
+			    '''\
+				The existing group database is inconsistent.  Group "{group}" is a duplicate.
+
+				This requires careful attention from a sysadmin.  Do not retry.
+				'''.format(group=grent.gr_name)
+			)
+		for member in group.members:
+			if member in users.by_name and group not in users.by_name[member].groups:
+				users.by_name[member].groups.append(group)
+	print()
+
+
+load_existing_dbs(users, groups)
+
+
+def import_users(
+    inputlines: List[str],
+    all_users: DualDB[UserEntry],
+    all_groups: DualDB[GroupEntry],
+    homepath: Path,
+) -> Tuple[DualDB[UserEntry], DualDB[GroupEntry]]:
+	collected_profiles: DualDB[UserEntry] = DualDB('uid', 'name')
+	collected_memberships: DualDB[UserEntry] = DualDB('uid', 'name')
+
+	print('Processing user entries.')
+	for line in inputlines:
+		line = line.strip()
+		if not line:
+			continue
+		# jtikalsky:x:4156:4156:Jesra Tikalsky:/afs/hep.wisc.edu/home/jtikalsky:/bin/bash
+		m = re.match(
+		    r'^(?P<name>[a-z0-9]+):[^:]+:(?P<uid>[0-9]+):(?P<gid>[0-9]+):(?P<gecos>[^:]+):(?P<home>[^:]+):(?P<shell>[^:]+)$',
+		    line, re.I
+		)
+		if m is not None:
+			print('Found profile for {user}.'.format(user=m.group('name')))
+			profile = UserEntry()
+			try:
+				profile.update(**m.groupdict())
+			except (ConflictError, TypeError) as e:
+				die('Unable to process profile for {user}: {e}'.format(user=repr(m.group('name')), e=str(e)))
+			try:
+				collected_profiles.add(profile)
+			except DuplicateError as e:
+				die(
+				    'There is already a pending profile for the {field} {value}.'.format(
+				        field=e.field, value=repr(getattr(profile, e.field))
+				    )
+				)
+			continue
+
+		# uid=4156(jtikalsky) gid=4156(jtikalsky) groups=4156(jtikalsky),5556(users),19000(cms)
+		m = re.match(
+		    r'^uid=(?P<uid>[0-9]+)\((?P<uname>[^\)]+)\) gid=(?P<gid>[0-9]+)\((?P<group>[^\)]+)\) groups=(?P<grouplist>.*)$',
+		    line, re.I
+		)
+		if m is not None:
+			print('Found membership for {user}.'.format(user=m.group('uname')))
+			profile = UserEntry()
+			try:
+				profile.update(uid=m.group('uid'), name=m.group('uname'), gid=m.group('gid'))
+			except (ConflictError, TypeError) as e:
+				die('Unable to process membership for {user}: {e}'.format(user=repr(m.group('uname')), e=str(e)))
+			try:
+				collected_memberships.add(profile)
+			except DuplicateError as e:
+				die(
+				    'There is already a pending membership for the {field} {value}.'.format(
+				        field=e.field, value=repr(getattr(profile, e.field))
+				    )
+				)
+			primary_group = GroupEntry()
+			primary_group.gid = int(m.group('gid'))
+			primary_group.name = m.group('group')
+			profile.groups.append(primary_group)
+			for uginfo in m.group('grouplist').split(','):
+				m2 = re.match(r'^(?P<gid>[0-9]+)\((?P<gname>[^\)]+)\)$', uginfo, re.I)
+				if m2 is None:
+					die('Unable to parse group information: ' + str(uginfo))
+				group = GroupEntry()
+				group.gid = int(m2.group('gid'))
+				group.name = m2.group('gname')
+				if group != primary_group:
+					profile.groups.append(group)
+			continue
+		print('Unknown record ignored: ' + line, file=sys.stderr)
+
+	collected_users: DualDB[UserEntry] = DualDB('uid', 'name')
+	for name in list(collected_profiles.by_name.keys()):
+		profile = collected_profiles[name]
+		if name not in collected_memberships:
+			die('No membership (`id {name}`) was submitted for {name}.'.format(name=name))
+		membership = collected_memberships[name]
+		if (profile.uid, profile.name, profile.gid) != (membership.uid, membership.name, membership.gid):
+			die('The profile and membership information for {name} do not match.'.format(name=name))
+		profile.groups = membership.groups
+		try:
+			collected_users.add(profile)
+		except DuplicateError as e:
+			die(
+			    'The pending users {u1.name} ({u1.uid}) and {u2.name} ({u2.uid}) have the same {field}.'.format(
+			        field=e.field, u1=collected_users[getattr(profile, e.field)], u2=profile
+			    )
+			)
+	for name in list(collected_memberships.by_name.keys()):
+		if name not in collected_profiles:
+			die('No profile (`getent passwd {name}`) was submitted for {name}.'.format(name=name))
+
+	print('All users entries processed.')
+	print()
+
+	# We now have a self-consistent list of imported users, but we need to
+	# ensure they are all new, confirm group consistency, and perform any
+	# relevant group discards or gid transformations, as well as cross-validate
+	# the list against existing users and groups.
+	print('Performing validation.')
+
+	# We now have a list of collected users.  But are any of them pre-existing?
+	for user in list(collected_users):
+		if user.name in all_users:
+			print(
+			    'A user by the name of {name} is already present.  Not attempting to add {name} (uid {uid}).'.format(
+			        name=user.name, uid=user.uid
+			    )
+			)
+			del collected_users[user]
+		elif user.uid in all_users:
+			print(
+			    'A user with the uid of {uid} is already present.  Not attempting to add {name} (uid {uid}).'.format(
+			        name=user.name, uid=user.uid
+			    )
+			)
+			del collected_users[name]
+
+	# Collect groups, now that our list of users is settled.
+	collected_groups: DualDB[GroupEntry] = DualDB('gid', 'name')
+	for user in collected_users:
+		# Collect this user's groups
+		for group in user.groups:
+			if group not in collected_groups:
+				collected_groups.add(group)
+		# "Merge" group entries by keeping only the 'official' copy of each one.
+		user.groups = [collected_groups[group] for group in user.groups]
+
+	# Apply some gid-based safety rules:
+	# 1. If gid < 100, discard the group.
+	# 2. If group_name exists, and that groups gid < 100, discard the group.
+	# 3. If gid < 1000,
+	#    3a. If a group with the same name exists in [100,1000), reuse that.
+	#    3b. If a group with the same name exists, abort.
+	#    3c. If the same gid is available within [100,1000), add the group as-is.
+	#    3d. Remap it to a new group with a gid within (100,1000).
+	# 4. If gid >= 1000,
+	#    4a. If a group with the same name exists with a different gid, abort.
+	#    4b. If a group with the same gid exists with a different name, abort.
+	for group in list(collected_groups):
+		# Rule 1
+		if group.gid < 100:
+			print('Group {group.name} (gid {group.gid}) has a very low gid.  Discarding it.'.format(group=group))
+			del collected_groups[group]
+			continue
+		# Rule 2
+		if group.name in all_groups and all_groups[group.name].gid < 100:
+			print(
+			    'Group {group.name} (gid {group.gid}) shares the name of core-system group {egroup.name} (gid {egroup.gid}).  Discarding it.'
+			    .format(group=group, egroup=all_groups[group.name])
+			)
+			del collected_groups[group]
+			continue
+		# Rule 3
+		if group.gid < 1000:
+			# Rule 3a
+			if group.name in all_groups and all_groups[group.name].gid in range(100, 1000):
+				if group.gid != all_groups[group.name].gid:
+					print(
+					    'Remapping group {group.name} (gid {group.gid}) to existing group {egroup.name} (gid {egroup.gid}).'
+					    .format(group=group, egroup=all_groups[group.name])
+					)
+					group.gid = all_groups[group.name].gid
+				continue
+			# Rule 3b
+			if group.name in all_groups:
+				die(
+				    '''\
+					Incoming system group {group.name} (gid {group.gid}) conflicts with existing system group {egroup.name} (gid {egroup.gid}).
+
+					Manually remove references to {group.name} and try again, or seek help.
+					'''.format(group=group, egroup=all_groups[group.name])
+				)
+			if group.gid not in all_groups:
+				pass  # Rule 3c
+			else:
+				# Rule 3d
+				remapped = False
+				for newgid in range(101, 1000):
+					if newgid in all_groups:
+						continue  # Already in use.
+					# We now have a valid newgid.
+					print(
+					    'Remapping new group {group.name} (gid {group.gid}) to unused gid {newgid}.'.format(
+					        group=group, newgid=newgid
+					    )
+					)
+					group.gid = newgid
+					remapped = True
+					break
+				if not remapped:
+					die(
+					    '''\
+						Unable to allocate a gid in the range (100, 1000).
+
+						This requires attention from a sysadmin.
+						'''
+					)
+		# "Else" gid was not < 1000.
+		# Rule 4a:
+		if group.name in all_groups and group.gid != all_groups[group.name].gid:
+			die(
+			    '''\
+					Incoming group {group.name} (gid {group.gid}) conflicts with existing group {egroup.name} (gid {egroup.gid}).
+
+					Manually remove references to {group.name} and try again, or seek help.
+					'''.format(group=group, egroup=all_groups[group.name])
+			)
+		# Rule 4b:
+		if group.gid in all_groups and group.name != all_groups[group.gid].name:
+			die(
+			    '''\
+					Incoming group {group.name} (gid {group.gid}) conflicts with existing group {egroup.name} (gid {egroup.gid}).
+
+					Manually remove references to gid {group.gid} and try again, or seek help.
+					'''.format(group=group, egroup=all_groups[group.name])
+			)
+
+	# And now, rewrite homedirs, and confirm groups.
+	for user in collected_users:
+		user.home = str(homepath / user.name)
+		user.shell = '/bin/bash'
+		user.groups = [collected_groups[g.name] for g in user.groups if g.name in collected_groups]
+
+	# Finally, having rewritten user groups, discard all 'new' groups that are not new.
+	final_groups: DualDB[GroupEntry] = DualDB('gid', 'name')
+	for group in collected_groups:
+		if group.gid not in all_groups:
+			final_groups.add(group)
+
+	print('Validation complete.')
+	print()
+	return collected_users, final_groups
+
+
+new_users, new_groups = import_users(inputlines, users, groups, template_home.parent)
+
+print('New groups:')
+for group in new_groups:
+	print('{group.gid:6d}  {group.name}'.format(group=group))
+print()
+
+print('New users:')
+for user in new_users:
+	print('{user.uid:6d}  {user.name:12s}  ({groups})'.format(user=user, groups=', '.join(g.name for g in user.groups)))
+print()
+
+print('Press Ctrl-C to cancel.')
+
+
+def sigint_terminate(signum, frame):
+	print('Aborted.')
+	raise SystemExit(1)
+
+
+signal.signal(signal.SIGINT, sigint_terminate)
+
+for i in range(5, -1, -1):
+	print('{}..'.format(i), end=' ')
+	sys.stdout.flush()
+	time.sleep(1)
+print()
+
+print('Proceeding.')
+time.sleep(1)
+
+signal.signal(signal.SIGINT, signal.SIG_IGN)
+# ^ You had your chance, and we can't just be doing this half-way.
+
+print('Performing operations.')
+print()
+
+print('Adding groups.')
+for group in new_groups:
+	try:
+		subprocess.run(['groupadd', '-g', str(group.gid), group.name], check=True)
+	except subprocess.CalledProcessError:
+		die('Unable to add group {group.name} (gid {group.gid}).'.format(group=group))
+print('Groups added.')
+
+print('Adding users.')
+for user in new_users:
+	try:
+		subprocess.run([
+		    'useradd', '-u',
+		    str(user.uid), '-g',
+		    str(user.gid), '-d', user.home, '-s', user.shell, '-N', '-M', user.name
+		],
+		               check=True)
+	except subprocess.CalledProcessError:
+		die('Unable to add user {user.name} (uid {user.gid}).'.format(user=user))
+print('Users added.')
+
+print('Creating home directories.')
+create_as_user = False
+try:
+	if (template_home.parent.stat().st_mode & 0o0007) == 0o0007:
+		# Users can create their own home directories.
+		# Root... who knows.  root_squash is a thing.
+		# We'll let the user do it.
+		create_as_user = True
+except Exception:
+	# Well, if we can't even stat the home-base directory, root can't create them.
+	create_as_user = True
+
+manual_intervention: List[UserEntry] = []
+for user in new_users:
+	if not create_as_user:
+		if Path(user.home).exists():
+			continue
+		try:
+			os.mkdir(user.home)
+			os.chown(user.home, user.uid, user.gid)
+			os.chmod(user.home, 0o0755)
+		except Exception as e:
+			pass  # We'll try to create it as the user instead, then.
+	try:
+		subprocess.run([
+		    'sudo', '-u', user.name, '/bin/bash', '-c',
+		    '[ -e "$HOME" ] && exit 0; mkdir "$HOME" || exit 1; chmod go-w "$HOME" || exit 1'
+		],
+		               stdin=subprocess.DEVNULL,
+		               check=True)
+	except subprocess.CalledProcessError:
+		manual_intervention.append(user)
+		continue
+
+if manual_intervention:
+	print('Manual intervention required!')
+	print('Please ensure home directories are correctly created for the following users:')
+	print(' '.join(user.name for user in manual_intervention))
+	print()
+
+print('Complete!')
