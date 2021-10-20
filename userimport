@@ -531,6 +531,28 @@ def import_users(
 		user.home = str(homepath / user.name)
 		user.shell = '/bin/bash'
 		user.groups = [collected_groups[g.name] for g in user.groups if g.name in collected_groups]
+		if user.gid not in collected_groups:
+			# This user's primary group was discarded as invalid.
+			if 'users' in all_groups:
+				print(
+				    "User {user.name} has an invalid primary group.  Assigning them to the group 'users'.".format(
+				        user=user
+				    )
+				)
+				user.gid = all_groups['users'].gid
+				user.groups.insert(0, all_groups['users'])
+			elif user.groups:
+				print(
+				    "User {user.name} has an invalid primary group.  Using their secondary group {group.name}.".format(
+				        user=user, group=user.groups[0]
+				    )
+				)
+				user.gid = user.groups[0].gid
+			else:
+				die(
+				    'User {user.name} has an invalid primary group, and we do not have a group to assign them to.'.
+				    format(user=user)
+				)
 
 	# Finally, having rewritten user groups, discard all 'new' groups that are not new.
 	final_groups: DualDB[GroupEntry] = DualDB('gid', 'name')
