@@ -34,7 +34,6 @@ export %{version_shellvars}
 
 
 %files
-%doc README.md
 %{python3_sitelib}/*
 %{_bindir}/userimport
 
